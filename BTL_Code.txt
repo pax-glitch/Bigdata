@@ -1,0 +1,142 @@
+# Load libraries
+library(sparklyr)
+library(dplyr)
+library(tidyverse)
+library(syuzhet)
+library(ggplot2)
+library(textclean)
+library(readr)
+
+# Kiểm tra nếu thư viện chưa cài đặt thì cài đặt
+required_packages <- c("sparklyr", "dplyr", "tidyverse", "syuzhet", "ggplot2", "textclean", "readr")
+new_packages <- required_packages[!(required_packages %in% installed.packages()[, "Package"])]
+
+if (length(new_packages)) {
+  install.packages(new_packages)
+}
+
+# Khởi tạo Spark
+sc <- tryCatch({
+  spark_connect(master = "local")
+}, error = function(e) {
+  stop("Lỗi khi kết nối Spark: ", e$message)
+})
+
+# Hàm đọc file với xử lý lỗi mã hóa
+read_clean_csv <- function(file_path) {
+  if (!file.exists(file_path)) {
+    warning(paste("File không tồn tại:", file_path))
+    return(NULL)
+  }
+  
+  df <- tryCatch({
+    read_csv(file_path, locale = locale(encoding = "ISO-8859-1"), guess_max = 100000)
+  }, error = function(e) {
+    warning(paste("Lỗi khi đọc file:", file_path, "-", e$message))
+    return(NULL)
+  })
+  
+  if (!is.null(df)) {
+    df <- df %>% mutate(across(where(is.character), ~ iconv(.x, from = "ISO-8859-1", to = "UTF-8", sub = "")))
+  }
+  
+  return(df)
+}
+
+# Đọc dữ liệu từ các file CSV
+files <- c(
+  "E:/BaiTap/Big_Data/BTL_BigData_Dataset/sentimentdataset.csv",
+  "E:/BaiTap/Big_Data/BTL_BigData_Dataset/train.csv",
+  "E:/BaiTap/Big_Data/BTL_BigData_Dataset/training.1600000.processed.noemoticon.csv",
+  "E:/BaiTap/Big_Data/BTL_BigData_Dataset/test.csv",
+  "E:/BaiTap/Big_Data/BTL_BigData_Dataset/testdata.manual.2009.06.14.csv"
+)
+
+data_list <- lapply(files, read_clean_csv)
+data_list <- Filter(Negate(is.null), data_list) # Loại bỏ NULL nếu có lỗi đọc file
+
+if (length(data_list) == 0) {
+  stop("Không có file nào được đọc thành công.")
+}
+
+# Kết hợp dữ liệu từ các file
+data_combined <- tryCatch({
+  bind_rows(data_list) %>% distinct()
+}, error = function(e) {
+  stop("Lỗi khi gộp dữ liệu: ", e$message)
+})
+
+print("Thông tin tổng quan về dữ liệu:")
+print(str(data_combined))
+print(summary(data_combined))
+
+# Xác định cột văn bản hợp lệ
+text_col_candidates <- c("text", "content", "tweet", "selected_text")
+text_col <- intersect(names(data_combined), text_col_candidates)
+
+if (length(text_col) == 0) {
+  stop("Không tìm thấy cột văn bản hợp lệ.")
+} else {
+  text_col <- text_col[1]  # Lấy cột đầu tiên trong danh sách hợp lệ
+}
+
+print(paste("Cột văn bản được chọn:", text_col))
+
+# Chọn cột văn bản và làm sạch dữ liệu
+data_combined <- data_combined %>% select(all_of(text_col)) %>% distinct() %>% drop_na()
+
+if (nrow(data_combined) == 0) {
+  stop("Không có văn bản hợp lệ để phân tích cảm xúc.")
+}
+
+clean_text <- function(text) {
+  if (is.na(text) || text == "") return(NA)
+  tryCatch({
+    text %>%
+      tolower() %>%
+      replace_non_ascii() %>%
+      str_replace_all("[^a-z ]", "") %>%
+      str_squish()
+  }, error = function(e) {
+    return(NA)
+  })
+}
+
+data_combined$clean_text <- sapply(data_combined[[text_col]], clean_text)
+data_combined <- data_combined %>% filter(!is.na(clean_text) & clean_text != "")
+
+print("Dữ liệu sau khi làm sạch:")
+print(head(data_combined$clean_text, 10))
+
+if (nrow(data_combined) > 0) {
+  # Xử lý cảm xúc
+  sentiment_scores <- tryCatch({
+    get_nrc_sentiment(data_combined$clean_text)
+  }, error = function(e) {
+    stop("Lỗi khi phân tích cảm xúc: ", e$message)
+  })
+  
+  data_combined <- cbind(data_combined, sentiment_scores)
+  
+  sentiment_summary <- colSums(sentiment_scores, na.rm = TRUE)
+  sentiment_df <- data.frame(Sentiment = names(sentiment_summary), Score = sentiment_summary)
+  
+  if (nrow(sentiment_df) > 0) {
+    plot <- ggplot(sentiment_df, aes(x = Sentiment, y = Score, fill = Sentiment)) +
+      geom_bar(stat = "identity") +
+      theme_minimal() +
+      labs(title = "Phân tích cảm xúc người dùng trên mạng xã hội",
+           x = "Loại cảm xúc", y = "Số lượng") +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    
+    print(plot)
+  } else {
+    warning("Không có dữ liệu cảm xúc để vẽ biểu đồ.")
+  }
+} else {
+  warning("Không có văn bản hợp lệ để phân tích cảm xúc.")
+}
+
+# Ngắt kết nối với Spark
+spark_disconnect(sc)
+print("Đã ngắt kết nối với Spark.")
